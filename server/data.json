@@ -1,0 +1,35 @@
+{
+  "users": [
+    {
+      "id": "5dacb3ab-786c-4775-b3cb-69d7d1b0ed48",
+      "phone": "+201212421880",
+      "role": "student",
+      "passwordHash": "$2b$12$vgc7xieaxQ2a2pR0Cns8U.OEj7Otv9spKjzpMlE7g/n/vawQPk9au",
+      "createdAt": "2026-08-22T16:12:53.922Z"
+    }
+  ],
+  "otps": [],
+  "messages": [
+    {
+      "id": "9a061022-430e-4f14-95a8-a7d5f7d7af5d",
+      "senderId": "5dacb3ab-786c-4775-b3cb-69d7d1b0ed48",
+      "recipient": "student",
+      "content": "an farouk eldamg",
+      "createdAt": "2026-08-22T16:13:14.239Z"
+    },
+    {
+      "id": "5bf7a84b-d0e7-4513-951b-4b3385ff1c05",
+      "senderId": "5dacb3ab-786c-4775-b3cb-69d7d1b0ed48",
+      "recipient": "student",
+      "content": "ana farouk eldamg",
+      "createdAt": "2026-08-22T16:13:27.364Z"
+    },
+    {
+      "id": "7fc875f1-bfa6-438e-8f07-cefb9b2b5b5c",
+      "senderId": "5dacb3ab-786c-4775-b3cb-69d7d1b0ed48",
+      "recipient": "teacher",
+      "content": "ds",
+      "createdAt": "2026-08-22T17:21:01.750Z"
+    }
+  ]
+}
