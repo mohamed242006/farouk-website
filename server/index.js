@@ -3,57 +3,233 @@ import express from 'express'
 import cookieParser from 'cookie-parser'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
-import crypto from 'node:crypto'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import mongoose from 'mongoose'
 
 const app = express()
 const port = process.env.PORT || 3000
-const secret = process.env.SESSION_SECRET
+const secret = process.env.SESSION_SECRET || 'fallback_secret_key'
 const rootDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)))
-const normalizePhone = (phone) => String(phone || '').replace(/[\s()-]/g, '')
 
-const userSchema = new mongoose.Schema({ displayName: { type: String, required: true, trim: true, maxlength: 80 }, phone: { type: String, required: true, unique: true }, role: { type: String, enum: ['teacher', 'student'], required: true }, passwordHash: { type: String, required: true } }, { timestamps: true })
-const otpSchema = new mongoose.Schema({ phone: { type: String, required: true, unique: true }, codeHash: { type: String, required: true }, displayName: String, role: { type: String, enum: ['teacher', 'student'] }, passwordHash: String, expiresAt: { type: Date, required: true, index: { expires: 0 } } })
-const messageSchema = new mongoose.Schema({ senderId: { type: mongoose.Schema.Types.ObjectId, required: true, ref: 'User' }, recipientIds: [{ type: mongoose.Schema.Types.ObjectId, required: true, ref: 'User' }], recipientRole: { type: String, enum: ['teacher', 'student'], required: true }, content: { type: String, required: true, maxlength: 2000 } }, { timestamps: true })
+// Schemas
+const userSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true, trim: true },
+    displayName: { type: String, required: true, trim: true },
+    role: { type: String, enum: ['student', 'teacher', 'admin'], required: true },
+    passwordHash: { type: String, required: true }
+}, { timestamps: true })
+
+const conversationSchema = new mongoose.Schema({
+    studentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    teacherId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    anonCode: { type: String, required: true }, // e.g. "Student #4829"
+    deletedByStudent: { type: Boolean, default: false },
+    deletedByTeacher: { type: Boolean, default: false },
+    lastMessageAt: { type: Date, default: Date.now }
+}, { timestamps: true })
+
+const messageSchema = new mongoose.Schema({
+    conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true },
+    senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    senderRole: { type: String, enum: ['student', 'teacher', 'admin'], required: true },
+    type: { type: String, enum: ['text', 'image', 'audio'], default: 'text' },
+    content: { type: String, required: true }, // Text or Base64 Data URL for media
+    readByTeacher: { type: Boolean, default: false },
+    readByStudent: { type: Boolean, default: false }
+}, { timestamps: true })
+
 const User = mongoose.model('User', userSchema)
-const Otp = mongoose.model('Otp', otpSchema)
+const Conversation = mongoose.model('Conversation', conversationSchema)
 const Message = mongoose.model('Message', messageSchema)
 
-const sendOtp = async (phone, code) => {
-    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_FROM_NUMBER) throw new Error('SMS delivery is not configured. Add the Twilio settings to .env.')
-    const body = new URLSearchParams({ To: phone, From: process.env.TWILIO_FROM_NUMBER, Body: `Your Sirr confirmation code is ${code}. It expires in 10 minutes.` })
-    const credentials = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64')
-    const sms = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_ACCOUNT_SID}/Messages.json`, { method: 'POST', headers: { Authorization: `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' }, body })
-    if (!sms.ok) throw new Error('The confirmation SMS could not be sent. Check your phone number and SMS settings.')
+// Auth Middleware
+const auth = async (req, res, next) => {
+    try {
+        const token = req.cookies.sirr_session
+        if (!token) throw new Error()
+        const decoded = jwt.verify(token, secret)
+        const user = await User.findById(decoded.sub)
+        if (!user) throw new Error()
+        req.user = user
+        next()
+    } catch {
+        res.status(401).json({ error: 'Please sign in first.' })
+    }
 }
-const auth = async (request, response, next) => { try { request.user = jwt.verify(request.cookies.sirr_session, secret); if (!(await User.exists({ _id: request.user.sub }))) throw new Error(); next() } catch { response.status(401).json({ error: 'Please sign in first.' }) } }
 
-app.use(express.json({ limit: '12kb' }))
+app.use(express.json({ limit: '10mb' }))
 app.use(cookieParser())
 app.use(express.static(path.join(rootDir, 'dist')))
-app.post('/api/auth/signup', async (request, response) => {
-    try {
-        const phone = normalizePhone(request.body.phone); const { password, role, teacherKey, displayName } = request.body
-        if (!/^\+?[1-9]\d{7,14}$/.test(phone) || !password || password.length < 8 || !displayName?.trim() || !['teacher', 'student'].includes(role)) return response.status(400).json({ error: 'Enter your name, a valid phone, 8+ character password, and role.' })
-        if (role === 'teacher' && (!process.env.TEACHER_ACCESS_CODE || teacherKey !== process.env.TEACHER_ACCESS_CODE)) return response.status(403).json({ error: 'The teacher access code is not correct.' })
-        if (await User.exists({ phone })) return response.status(409).json({ error: 'This phone number is already registered.' })
-        const code = String(crypto.randomInt(100000, 1000000))
-        await Otp.findOneAndUpdate({ phone }, { phone, codeHash: await bcrypt.hash(code, 10), role, displayName: displayName.trim(), passwordHash: await bcrypt.hash(password, 12), expiresAt: new Date(Date.now() + 10 * 60 * 1000) }, { upsert: true })
-        try { await sendOtp(phone, code) } catch (error) { await Otp.deleteOne({ phone }); return response.status(503).json({ error: error.message }) }
-        response.json({ message: 'Confirmation code sent to your mobile.' })
-    } catch { response.status(500).json({ error: 'Could not start registration.' }) }
-})
-app.post('/api/auth/verify', async (request, response) => { const phone = normalizePhone(request.body.phone); const pending = await Otp.findOne({ phone }); if (!pending || pending.expiresAt < new Date() || !(await bcrypt.compare(String(request.body.otp), pending.codeHash))) return response.status(400).json({ error: 'That confirmation code is invalid or expired.' }); const user = await User.create({ phone, displayName: pending.displayName, role: pending.role, passwordHash: pending.passwordHash }); await Otp.deleteOne({ _id: pending._id }); response.cookie('sirr_session', jwt.sign({ sub: user.id, role: user.role }, secret, { expiresIn: '7d' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 }).json({ message: 'Account verified.' }) })
-app.post('/api/auth/signin', async (request, response) => { const user = await User.findOne({ phone: normalizePhone(request.body.phone) }); if (!user || !(await bcrypt.compare(request.body.password || '', user.passwordHash))) return response.status(401).json({ error: 'Phone number or password is incorrect.' }); response.cookie('sirr_session', jwt.sign({ sub: user.id, role: user.role }, secret, { expiresIn: '7d' }), { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 }).json({ message: 'Signed in.' }) })
-app.post('/api/auth/signout', (request, response) => response.clearCookie('sirr_session').json({ message: 'Signed out.' }))
-app.get('/api/session', auth, async (request, response) => { const user = await User.findById(request.user.sub).select('displayName role'); response.json({ user }) })
-app.get('/api/recipients', auth, async (request, response) => { const role = request.query.role; if (!['teacher', 'student'].includes(role)) return response.status(400).json({ error: 'Invalid recipient role.' }); const recipients = await User.find({ role }).select('displayName role').sort('displayName'); response.json({ recipients }) })
-app.get('/api/messages', auth, async (request, response) => { const messages = await Message.find({ recipientIds: request.user.sub }).sort({ createdAt: -1 }).lean(); response.json({ messages: messages.map((message) => ({ ...message, senderName: 'Anonymous' })) }) })
-app.post('/api/messages', auth, async (request, response) => { const content = String(request.body.content || '').trim(); const role = request.body.recipientRole; const recipientIds = request.body.sendToAll ? (await User.find({ role, _id: { $ne: request.user.sub } }).select('_id')).map((user) => user._id) : [request.body.recipientId]; if (!['teacher', 'student'].includes(role) || !recipientIds.length || recipientIds.includes(undefined) || content.length < 1 || content.length > 2000) return response.status(400).json({ error: 'Choose a recipient and write a message under 2,000 characters.' }); await Message.create({ senderId: request.user.sub, recipientIds, recipientRole: role, content }); response.status(201).json({ message: 'Sent anonymously.' }) })
-app.get('*', (request, response) => response.sendFile(path.join(rootDir, 'dist', 'index.html')))
 
-if (!secret) throw new Error('SESSION_SECRET is required.')
-if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is required.')
-mongoose.connect(process.env.MONGODB_URI).then(() => app.listen(port, () => console.log(`Sirr listening on http://localhost:${port}`))).catch((error) => { console.error('MongoDB connection failed:', error.message); process.exit(1) })
+// Auth Routes
+app.post('/api/auth/signup', async (req, res) => {
+    try {
+        const { role, username, displayName, password, accessCode } = req.body
+
+        if (!['student', 'teacher', 'admin'].includes(role) || !password || password.length < 6) {
+            return res.status(400).json({ error: 'Invalid details or password too short (min 6 chars).' })
+        }
+
+        let finalUsername = username ? username.trim().toLowerCase() : ''
+        let finalDisplayName = displayName ? displayName.trim() : ''
+
+        if (role === 'teacher') {
+            if (!process.env.TEACHER_ACCESS_CODE || accessCode !== process.env.TEACHER_ACCESS_CODE) {
+                return res.status(403).json({ error: 'Invalid Teacher Access Code.' })
+            }
+            finalUsername = `teacher_${Date.now()}`
+        } else if (role === 'admin') {
+            if (!process.env.ADMIN_ACCESS_CODE || accessCode !== process.env.ADMIN_ACCESS_CODE) {
+                return res.status(403).json({ error: 'Invalid Admin Access Code.' })
+            }
+            finalUsername = `admin_${Date.now()}`
+        } else {
+            if (!finalUsername) return res.status(400).json({ error: 'Username is required for students.' })
+            finalDisplayName = 'Anonymous Student'
+        }
+
+        if (await User.exists({ username: finalUsername })) {
+            return res.status(409).json({ error: 'Username is already taken.' })
+        }
+
+        const passwordHash = await bcrypt.hash(password, 10)
+        const user = await User.create({ username: finalUsername, displayName: finalDisplayName, role, passwordHash })
+
+        const token = jwt.sign({ sub: user._id, role: user.role }, secret, { expiresIn: '7d' })
+        res.cookie('sirr_session', token, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 })
+        res.json({ message: 'Account created successfully.', user: { id: user._id, role: user.role, displayName: user.displayName } })
+    } catch (err) {
+        res.status(500).json({ error: 'Registration failed.' })
+    }
+})
+
+app.post('/api/auth/signin', async (req, res) => {
+    try {
+        const { username, password } = req.body
+        const user = await User.findOne({ username: username.toLowerCase().trim() })
+        if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+            return res.status(401).json({ error: 'Invalid credentials.' })
+        }
+
+        const token = jwt.sign({ sub: user._id, role: user.role }, secret, { expiresIn: '7d' })
+        res.cookie('sirr_session', token, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000 })
+        res.json({ message: 'Signed in.', user: { id: user._id, role: user.role, displayName: user.displayName } })
+    } catch {
+        res.status(500).json({ error: 'Sign in failed.' })
+    }
+})
+
+app.post('/api/auth/signout', (req, res) => res.clearCookie('sirr_session').json({ message: 'Signed out.' }))
+
+app.get('/api/session', auth, (req, res) => {
+    res.json({ user: { id: req.user._id, role: req.user.role, displayName: req.user.displayName, username: req.user.username } })
+})
+
+// Teachers List
+app.get('/api/teachers', auth, async (req, res) => {
+    const teachers = await User.find({ role: 'teacher' }).select('_id displayName').sort('displayName')
+    res.json({ teachers })
+})
+
+// Conversations & Chat
+app.get('/api/conversations', auth, async (req, res) => {
+    try {
+        let query = {}
+        if (req.user.role === 'student') {
+            query = { studentId: req.user._id, deletedByStudent: false }
+        } else if (req.user.role === 'teacher') {
+            query = { teacherId: req.user._id, deletedByTeacher: false }
+        } // admin gets all conversations
+
+        const convs = await Conversation.find(query)
+            .populate('teacherId', 'displayName')
+            .populate('studentId', 'username')
+            .sort({ lastMessageAt: -1 })
+            .lean()
+
+        const formatted = convs.map(c => ({
+            id: c._id,
+            title: req.user.role === 'teacher' ? c.anonCode : c.teacherId?.displayName || 'Teacher',
+            studentCode: c.anonCode,
+            lastMessageAt: c.lastMessageAt
+        }))
+
+        res.json({ conversations: formatted })
+    } catch {
+        res.status(500).json({ error: 'Could not load conversations.' })
+    }
+})
+
+app.get('/api/conversations/:id/messages', auth, async (req, res) => {
+    try {
+        const conv = await Conversation.findById(req.params.id)
+        if (!conv) return res.status(404).json({ error: 'Chat not found.' })
+
+        if (req.user.role === 'student' && String(conv.studentId) !== String(req.user._id)) return res.status(403).json({ error: 'Access denied.' })
+        if (req.user.role === 'teacher' && String(conv.teacherId) !== String(req.user._id)) return res.status(403).json({ error: 'Access denied.' })
+
+        const messages = await Message.find({ conversationId: conv._id }).sort({ createdAt: 1 }).lean()
+        res.json({ messages })
+    } catch {
+        res.status(500).json({ error: 'Could not fetch messages.' })
+    }
+})
+
+app.post('/api/messages', auth, async (req, res) => {
+    try {
+        const { teacherId, conversationId, content, type = 'text' } = req.body
+        let conv
+
+        if (conversationId) {
+            conv = await Conversation.findById(conversationId)
+        } else if (teacherId && ['student', 'admin'].includes(req.user.role)) {
+            conv = await Conversation.findOne({ studentId: req.user._id, teacherId })
+            if (!conv) {
+                const randCode = `Student #${Math.floor(1000 + Math.random() * 9000)}`
+                conv = await Conversation.create({ studentId: req.user._id, teacherId, anonCode: randCode })
+            }
+        }
+
+        if (!conv) return res.status(400).json({ error: 'Invalid message target.' })
+
+        conv.deletedByStudent = false
+        conv.deletedByTeacher = false
+        conv.lastMessageAt = new Date()
+        await conv.save()
+
+        const msg = await Message.create({
+            conversationId: conv._id,
+            senderId: req.user._id,
+            senderRole: req.user.role,
+            type,
+            content
+        })
+
+        res.status(201).json({ message: msg, conversationId: conv._id })
+    } catch {
+        res.status(500).json({ error: 'Failed to send message.' })
+    }
+})
+
+app.delete('/api/conversations/:id', auth, async (req, res) => {
+    try {
+        const conv = await Conversation.findById(req.params.id)
+        if (!conv) return res.status(404).json({ error: 'Not found.' })
+
+        if (req.user.role === 'student') conv.deletedByStudent = true
+        if (req.user.role === 'teacher') conv.deletedByTeacher = true
+        await conv.save()
+
+        res.json({ message: 'Conversation deleted.' })
+    } catch {
+        res.status(500).json({ error: 'Action failed.' })
+    }
+})
+
+app.get('*', (req, res) => res.sendFile(path.join(rootDir, 'dist', 'index.html')))
+
+if (!process.env.MONGODB_URI) throw new Error('MONGODB_URI is missing.')
+mongoose.connect(process.env.MONGODB_URI).then(() => {
+    app.listen(port, () => console.log(`Server running on port ${port}`))
+})
